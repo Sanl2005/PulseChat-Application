@@ -45,6 +45,7 @@ dist/
 *.tsbuildinfo
 **/*.tsbuildinfo
 next-env.d.ts
+**/next-env.d.ts
 
 # Vercel
 .vercel/

@@ -1,0 +1,671 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { io } from "socket.io-client";
+import { useRouter } from "next/navigation";
+
+import "./globals.css";
+
+const socket = io("http://localhost:5000");
+
+type User = {
+    id: number;
+    username: string;
+    display_name?: string;
+};
+
+type Conversation = {
+    id: number;
+    name: string | null;
+    is_group: boolean;
+    display_name?: string;
+};
+
+type ChatMessage = {
+    id: number;
+    conversation_id: number;
+    sender_id: number;
+    sender_name: string;
+    content: string;
+    created_at: string;
+};
+
+type SummaryItem = {
+    messageId: number;
+    message_id?: number;
+    text: string;
+    senderName?: string;
+    sender_name?: string;
+    importanceScore?: number;
+    importance_score?: number;
+};
+
+type GroundedSummaryItem = {
+    text?: string;
+    person?: string;
+    task?: string;
+    deadline?: string | null;
+    date?: string | null;
+    topic?: string;
+    summary?: string;
+    source_message_ids: number[];
+};
+
+type StructuredSummary = {
+    mode?: "gemini" | "extractive_fallback";
+    model?: string | null;
+    overview: string;
+    key_topics: GroundedSummaryItem[];
+    decisions: GroundedSummaryItem[];
+    action_items: GroundedSummaryItem[];
+    deadlines: GroundedSummaryItem[];
+    open_questions: GroundedSummaryItem[];
+    important_points: GroundedSummaryItem[];
+    generated_at?: string;
+};
+
+type ConversationSummary = {
+    summary: StructuredSummary | null;
+    items: SummaryItem[];
+    topics: { cluster_id?: number; clusterId?: number; topic_label?: string; topicLabel?: string }[];
+    graph?: { nodes: number; edges: number; clusters: number; selectedMessageCount: number; processingTimeMs: number; algorithmVersion: string };
+};
+
+export default function Home() {
+    const router = useRouter();
+    const [users, setUsers] = useState<User[]>([]);
+    const [currentUser, setCurrentUser] = useState<User | null>(null);
+    const [conversations, setConversations] = useState<Conversation[]>([]);
+    const [selectedConversation, setSelectedConversation] = useState<Conversation | null>(null);
+    const [messages, setMessages] = useState<ChatMessage[]>([]);
+    const [message, setMessage] = useState("");
+    const [showGroupForm, setShowGroupForm] = useState(false);
+    const [groupName, setGroupName] = useState("");
+    const [selectedMembers, setSelectedMembers] = useState<number[]>([]);
+    const [searchTerm, setSearchTerm] = useState("");
+    const [searchResults, setSearchResults] = useState<User[]>([]);
+    const [searchError, setSearchError] = useState("");
+    const [summaryData, setSummaryData] = useState<ConversationSummary | null>(null);
+    const [showSummary, setShowSummary] = useState(false);
+    const [summaryLoading, setSummaryLoading] = useState(false);
+    const [summaryError, setSummaryError] = useState("");
+    useEffect(() => {
+
+        const user =
+            localStorage.getItem(
+                "pulsechat_user"
+            );
+
+        if (!user) {
+
+            router.push("/login");
+
+            return;
+
+        }
+
+        try {
+            const parsedUser = JSON.parse(user) as User;
+            const timer = window.setTimeout(() => {
+                setCurrentUser(parsedUser);
+            }, 0);
+
+            return () => window.clearTimeout(timer);
+        } catch {
+            localStorage.removeItem("pulsechat_user");
+            localStorage.removeItem("pulsechat_token");
+            router.replace("/login");
+        }
+
+    }, [router]);
+    
+    // Step 10: State for New Chat panel
+    const [showNewChat, setShowNewChat] = useState(false);
+
+    /* =====================================================
+       LOAD USERS
+    ===================================================== */
+    useEffect(() => {
+        fetch("http://localhost:5000/api/users")
+            .then(res => res.json())
+            .then(data => {
+                setUsers(data);
+            })
+            .catch(error => {
+                console.error("User loading error:", error);
+            });
+    }, []);
+
+    /* Search the database after the user has entered two characters. */
+    useEffect(() => {
+        const query = searchTerm.trim();
+        const token = localStorage.getItem("pulsechat_token");
+
+        if (query.length < 2 || !token) {
+            setSearchResults([]);
+            setSearchError("");
+            return;
+        }
+
+        const controller = new AbortController();
+        const timer = window.setTimeout(async () => {
+            try {
+                const response = await fetch(
+                    `http://localhost:5000/api/users/search?query=${encodeURIComponent(query)}`,
+                    {
+                        headers: { Authorization: `Bearer ${token}` },
+                        signal: controller.signal
+                    }
+                );
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error || "Search failed");
+                }
+
+                setSearchResults(data);
+                setSearchError("");
+            } catch (error) {
+                if ((error as Error).name !== "AbortError") {
+                    setSearchResults([]);
+                    setSearchError((error as Error).message || "Search failed");
+                }
+            }
+        }, 250);
+
+        return () => {
+            controller.abort();
+            window.clearTimeout(timer);
+        };
+    }, [searchTerm]);
+
+    /* =====================================================
+       LOAD CONVERSATIONS
+    ===================================================== */
+    useEffect(() => {
+        if (!currentUser) {
+            return;
+        }
+
+        fetch(`http://localhost:5000/api/conversations/${currentUser.id}`)
+            .then(res => res.json())
+            .then(data => {
+                setConversations(data);
+            })
+            .catch(error => {
+                console.error("Conversation loading error:", error);
+            });
+    }, [currentUser]);
+
+    /* =====================================================
+       LOAD MESSAGES
+    ===================================================== */
+    useEffect(() => {
+        if (!selectedConversation) {
+            return;
+        }
+
+        fetch(`http://localhost:5000/api/messages/${selectedConversation.id}`)
+            .then(res => res.json())
+            .then(data => {
+                setMessages(data);
+            })
+            .catch(error => {
+                console.error("Message loading error:", error);
+            });
+
+        /* Join Socket.IO room */
+        socket.emit("join_conversation", selectedConversation.id);
+
+        /* Mark messages read */
+        if (currentUser) {
+            socket.emit("mark_read", {
+                conversationId: selectedConversation.id,
+                userId: currentUser.id
+            });
+        }
+
+        return () => {
+            socket.emit("leave_conversation", selectedConversation.id);
+        };
+    }, [selectedConversation, currentUser]);
+
+    /* =====================================================
+       RECEIVE MESSAGE
+    ===================================================== */
+    useEffect(() => {
+        const handleReceiveMessage = (newMessage: ChatMessage) => {
+            if (
+                selectedConversation &&
+                Number(newMessage.conversation_id) === Number(selectedConversation.id)
+            ) {
+                setMessages(prev => [...prev, newMessage]);
+            }
+        };
+
+        socket.on("receive_message", handleReceiveMessage);
+
+        return () => {
+            socket.off("receive_message", handleReceiveMessage);
+        };
+    }, [selectedConversation]);
+
+    /* =====================================================
+       Step 11: START DIRECT CHAT FUNCTION
+    ===================================================== */
+    const startDirectChat = async (otherUserId: number) => {
+        if (!currentUser) {
+            return;
+        }
+
+        try {
+            const response = await fetch(
+                "http://localhost:5000/api/conversations/direct",
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        userId: currentUser.id,
+                        otherUserId: otherUserId
+                    })
+                }
+            );
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                alert(data.error || "Unable to start chat");
+                return;
+            }
+
+            const conversation = data.conversation;
+
+            /* Add conversation to sidebar if it wasn't already there. */
+            setConversations(prev => {
+                const exists = prev.some(c => c.id === conversation.id);
+                if (exists) {
+                    return prev;
+                }
+                return [conversation, ...prev];
+            });
+
+            /* Select conversation */
+            setSelectedConversation(conversation);
+
+            /* Close New Chat window */
+            setShowNewChat(false);
+
+            /* Reload conversations so display_name is available. */
+            const conversationsResponse = await fetch(
+                `http://localhost:5000/api/conversations/${currentUser.id}`
+            );
+            const conversationsData = await conversationsResponse.json();
+            setConversations(conversationsData);
+
+            /* Select the newly opened conversation */
+            const selected = conversationsData.find((c: Conversation) => c.id === conversation.id);
+            if (selected) {
+                setSelectedConversation(selected);
+            }
+        } catch (error) {
+            console.error(error);
+            alert("Failed to start conversation");
+        }
+    };
+
+    /* =====================================================
+       SEND MESSAGE
+    ===================================================== */
+    const sendMessage = () => {
+        if (!message.trim() || !currentUser || !selectedConversation) {
+            return;
+        }
+
+        socket.emit("send_message", {
+            conversationId: selectedConversation.id,
+            senderId: currentUser.id,
+            content: message
+        });
+
+        setMessage("");
+    };
+
+    const generateSummary = async () => {
+        if (!selectedConversation) return;
+        setSummaryLoading(true);
+        setSummaryError("");
+        try {
+            const token = localStorage.getItem("pulsechat_token");
+            const response = await fetch(`http://localhost:5000/api/conversations/${selectedConversation.id}/summarize`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                body: JSON.stringify({ maxMessages: 6 })
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || "Unable to generate summary");
+            setSummaryData(data);
+            setShowSummary(true);
+        } catch (error) {
+            setSummaryError((error as Error).message || "Unable to generate summary");
+        } finally {
+            setSummaryLoading(false);
+        }
+    };
+
+    const viewSource = (messageId: number) => {
+        document.getElementById(`message-${messageId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    };
+
+    const sourceButton = (sourceIds: number[]) => (
+        <button onClick={() => viewSource(sourceIds[0])}>View source</button>
+    );
+
+    /* =====================================================
+       ENTER KEY
+    ===================================================== */
+    const handleKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+        if (event.key === "Enter") {
+            sendMessage();
+        }
+    };
+
+    /* =====================================================
+       SELECT MEMBER
+    ===================================================== */
+    const toggleMember = (userId: number) => {
+        setSelectedMembers(prev => {
+            if (prev.includes(userId)) {
+                return prev.filter(id => id !== userId);
+            }
+            return [...prev, userId];
+        });
+    };
+
+    /* =====================================================
+       CREATE GROUP
+    ===================================================== */
+    const createGroup = async () => {
+        if (!groupName.trim() || !currentUser || selectedMembers.length === 0) {
+            alert("Enter a group name and select members.");
+            return;
+        }
+
+        try {
+            const response = await fetch(
+                "http://localhost:5000/api/conversations/group",
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        name: groupName,
+                        creatorId: currentUser.id,
+                        memberIds: selectedMembers
+                    })
+                }
+            );
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                alert(data.error || "Failed to create group");
+                return;
+            }
+
+            setConversations(prev => [data.conversation, ...prev]);
+            setSelectedConversation(data.conversation);
+            setGroupName("");
+            setSelectedMembers([]);
+            setShowGroupForm(false);
+        } catch (error) {
+            console.error(error);
+            alert("Failed to create group");
+        }
+    };
+
+    /* =====================================================
+       Step 12: FORMAT CONVERSATION NAME
+    ===================================================== */
+    const getConversationName = (conversation: Conversation) => {
+        return conversation.display_name || conversation.name || "Chat";
+    };
+
+    const logout = () => {
+        localStorage.removeItem("pulsechat_token");
+        localStorage.removeItem("pulsechat_user");
+        socket.disconnect();
+        router.replace("/login");
+    };
+
+    const peopleToShow = searchResults;
+    const getInitials = (name?: string | null) =>
+        (name || "PC").split(" ").map(part => part[0]).join("").slice(0, 2).toUpperCase();
+
+    return (
+        <main className="app-container">
+            {/* =================================================
+                SIDEBAR
+            ================================================= */}
+            <aside className="sidebar">
+                <div className="brand">
+                    <div className="brand-lockup"><span className="brand-orb">P</span><div><h1>PulseChat</h1><p>Smart communication</p></div></div>
+                </div>
+
+                <div className="profile-section">
+                    <div>
+                        <span className="profile-label">Signed in as</span>
+                        <strong>{currentUser?.display_name || currentUser?.username || "Loading..."}</strong>
+                    </div>
+                    <button className="logout-button" type="button" onClick={logout}>Log out</button>
+                </div>
+
+
+
+                {/* Step 13: SIDEBAR BUTTONS */}
+                <div className="conversation-header">
+                    <span className="section-title">Messages</span>
+                    <div className="conversation-actions">
+                        <button onClick={() => { setShowNewChat(!showNewChat); setSearchTerm(""); setSearchResults([]); }}>
+                            + Chat
+                        </button>
+                        <button onClick={() => setShowGroupForm(!showGroupForm)}>
+                            + Group
+                        </button>
+                    </div>
+                </div>
+
+                {/* Step 14: NEW CHAT POPUP */}
+                {showNewChat && (
+                    <div className="new-chat-panel">
+                        <h3>New Chat</h3>
+                        <input
+                            className="user-search"
+                            type="search"
+                            value={searchTerm}
+                            onChange={event => setSearchTerm(event.target.value)}
+                            placeholder="Search people or phone number"
+                            aria-label="Search global users"
+                        />
+                        {searchError && <p className="search-error">{searchError}</p>}
+                        {searchTerm.trim().length < 2 && <p className="search-hint">Enter at least two characters or complete phone number.</p>}
+                        {searchTerm.trim().length >= 2 && peopleToShow
+                            .filter(user => user.id !== currentUser?.id)
+                            .map(user => (
+                                <button
+                                    key={user.id}
+                                    className="new-chat-user"
+                                    onClick={() => startDirectChat(user.id)}
+                                >
+                                    <span>👤</span>
+                                    <span>{user.display_name || user.username}</span>
+                                </button>
+                            ))}
+                        {searchTerm.trim().length >= 2 && !searchError && peopleToShow.length === 0 && (
+                            <p className="search-empty">No users found.</p>
+                        )}
+                        <button
+                            className="cancel-new-chat"
+                            onClick={() => { setShowNewChat(false); setSearchTerm(""); setSearchResults([]); }}
+                        >
+                            Cancel
+                        </button>
+                    </div>
+                )}
+
+                <div className="conversation-list">
+                    {conversations.map(conversation => (
+                        <button
+                            key={conversation.id}
+                            className={
+                                selectedConversation?.id === conversation.id
+                                    ? "conversation active"
+                                    : "conversation"
+                            }
+                            onClick={() => {
+                                setSelectedConversation(conversation);
+                                setMessages([]);
+                                setSummaryData(null);
+                                setShowSummary(false);
+                            }}
+                        >
+                            <span className="conversation-icon">
+                                {conversation.is_group ? "👥" : "👤"}
+                            </span>
+                            <span>{getConversationName(conversation)}</span>
+                        </button>
+                    ))}
+                </div>
+            </aside>
+
+            {/* =================================================
+                MAIN CHAT
+            ================================================= */}
+            <section className="chat-area">
+                {!selectedConversation ? (
+                    <div className="empty-chat">
+                        <div className="empty-chat-icon">✦</div>
+                        <p className="eyebrow">YOUR INBOX</p>
+                        <h2>Your conversations, in one calm space.</h2>
+                        <p>Select a conversation from the sidebar or start a new chat.</p>
+                        <button className="empty-chat-action" onClick={() => setShowNewChat(true)}>Start a conversation</button>
+                    </div>
+                ) : (
+                    <>
+                        {/* Step 16: CHAT HEADER */}
+                        <header className="chat-header">
+                            <div>
+                                <h2>
+                                    {selectedConversation.is_group
+                                        ? `👥 ${selectedConversation.name}`
+                                        : `👤 ${selectedConversation.display_name}`}
+                                </h2>
+                                <p>
+                                    {selectedConversation.is_group
+                                        ? "Group conversation"
+                                        : "Private conversation"}
+                                </p>
+                            </div>
+                            <button className="summary-trigger" onClick={generateSummary} disabled={summaryLoading}>
+                                {summaryLoading ? "Building summary…" : "AI Summary"}
+                            </button>
+                        </header>
+
+                        {summaryError && <p className="summary-error">{summaryError}</p>}
+                        {showSummary && summaryData && (
+                            <aside className="summary-panel" aria-label="AI conversation summary">
+                                <div className="summary-heading"><div><p className="eyebrow">AI CONVERSATION SUMMARY</p><h3>Key moments</h3></div><button onClick={() => setShowSummary(false)} aria-label="Close summary">×</button></div>
+                                <p className="summary-overview">{summaryData.summary?.overview || summaryData.items.map(item => item.text).join(" ")}</p>
+                                {summaryData.summary?.key_topics.length ? <div className="summary-topics"><span>Key topics</span>{summaryData.summary.key_topics.map((topic, index) => <em key={`${topic.topic}-${index}`}>{topic.topic}</em>)}</div> : null}
+                                {summaryData.summary?.action_items.length ? <section className="summary-section"><h4>Action items</h4>{summaryData.summary.action_items.map((item, index) => <article key={`action-${index}`}><p><strong>{item.person}</strong> — {item.task}</p>{item.deadline && <small>Due: {item.deadline}</small>}<footer>{sourceButton(item.source_message_ids)}</footer></article>)}</section> : null}
+                                {summaryData.summary?.decisions.length ? <section className="summary-section"><h4>Decisions</h4>{summaryData.summary.decisions.map((item, index) => <article key={`decision-${index}`}><p>{item.text}</p><footer>{sourceButton(item.source_message_ids)}</footer></article>)}</section> : null}
+                                {summaryData.summary?.important_points.length ? <section className="summary-section"><h4>Important points</h4>{summaryData.summary.important_points.map((item, index) => <article key={`point-${index}`}><p>{item.text}</p><footer>{sourceButton(item.source_message_ids)}</footer></article>)}</section> : null}
+                                {summaryData.summary?.open_questions.length ? <section className="summary-section"><h4>Open questions</h4>{summaryData.summary.open_questions.map((item, index) => <article key={`question-${index}`}><p>{item.text}</p><footer>{sourceButton(item.source_message_ids)}</footer></article>)}</section> : null}
+                                {summaryData.graph && <details className="analysis-details"><summary>Analysis details</summary><dl><div><dt>Nodes</dt><dd>{summaryData.graph.nodes}</dd></div><div><dt>Edges</dt><dd>{summaryData.graph.edges}</dd></div><div><dt>Clusters</dt><dd>{summaryData.graph.clusters}</dd></div><div><dt>Selected</dt><dd>{summaryData.graph.selectedMessageCount}</dd></div><div><dt>Algorithm</dt><dd>{summaryData.graph.algorithmVersion}</dd></div></dl></details>}
+                            </aside>
+                        )}
+
+                        {/* MESSAGES */}
+                        <div className="messages">
+                            {messages.map(msg => (
+                                <div
+                                    key={msg.id}
+                                    id={`message-${msg.id}`}
+                                    className={
+                                        Number(msg.sender_id) === Number(currentUser?.id)
+                                            ? "message own"
+                                            : "message"
+                                    }
+                                >
+                                    {Number(msg.sender_id) !== Number(currentUser?.id) && <div className="sender">{msg.sender_name}</div>}
+                                    <div className="message-content">{msg.content}</div>
+                                    <div className="message-time">
+                                        {new Date(msg.created_at).toLocaleTimeString([], {
+                                            hour: "2-digit",
+                                            minute: "2-digit"
+                                        })}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+
+                        {/* MESSAGE INPUT */}
+                        <div className="message-input">
+                            <input
+                                type="text"
+                                value={message}
+                                onChange={e => setMessage(e.target.value)}
+                                onKeyDown={handleKeyDown}
+                                placeholder="Type a message..."
+                            />
+                            <button onClick={sendMessage} aria-label="Send message"><span>Send</span><span aria-hidden="true">→</span></button>
+                        </div>
+                    </>
+                )}
+
+                {/* =================================================
+                    GROUP CREATION MODAL
+                ================================================= */}
+                {showGroupForm && (
+                    <div className="group-modal">
+                        <div className="group-form">
+                            <h2>Create Group</h2>
+                            <input
+                                type="text"
+                                placeholder="Group name"
+                                value={groupName}
+                                onChange={e => setGroupName(e.target.value)}
+                            />
+
+                            <h3>Select Members</h3>
+
+                            <div className="member-list">
+                                {users
+                                    .filter(user => user.id !== currentUser?.id)
+                                    .map(user => (
+                                        <label key={user.id} className="member-option">
+                                            <input
+                                                type="checkbox"
+                                                checked={selectedMembers.includes(user.id)}
+                                                onChange={() => toggleMember(user.id)}
+                                            />
+                                            {user.display_name || user.username}
+                                        </label>
+                                    ))}
+                            </div>
+
+                            <div className="group-actions">
+                                <button onClick={() => setShowGroupForm(false)}>
+                                    Cancel
+                                </button>
+                                <button onClick={createGroup}>Create Group</button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </section>
+        </main>
+    );
+}
