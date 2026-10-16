@@ -28,6 +28,7 @@ type ChatMessage = {
     sender_name: string;
     content: string;
     created_at: string;
+    is_read?: boolean;
 };
 
 type SummaryItem = {
@@ -89,6 +90,7 @@ export default function Home() {
     const [showSummary, setShowSummary] = useState(false);
     const [summaryLoading, setSummaryLoading] = useState(false);
     const [summaryError, setSummaryError] = useState("");
+    const [highlightedMessageId, setHighlightedMessageId] = useState<number | null>(null);
     useEffect(() => {
 
         const user =
@@ -231,7 +233,7 @@ export default function Home() {
     }, [selectedConversation, currentUser]);
 
     /* =====================================================
-       RECEIVE MESSAGE
+       RECEIVE MESSAGE & READ RECEIPTS
     ===================================================== */
     useEffect(() => {
         const handleReceiveMessage = (newMessage: ChatMessage) => {
@@ -239,16 +241,44 @@ export default function Home() {
                 selectedConversation &&
                 Number(newMessage.conversation_id) === Number(selectedConversation.id)
             ) {
-                setMessages(prev => [...prev, newMessage]);
+                setMessages(prev => {
+                    const exists = prev.some(m => m.id === newMessage.id);
+                    if (exists) return prev;
+                    return [...prev, newMessage];
+                });
+
+                if (currentUser && Number(newMessage.sender_id) !== Number(currentUser.id)) {
+                    socket.emit("mark_read", {
+                        conversationId: selectedConversation.id,
+                        userId: currentUser.id
+                    });
+                }
+            }
+        };
+
+        const handleMessagesRead = (data: { conversationId: number; readerId: number }) => {
+            if (
+                selectedConversation &&
+                Number(data.conversationId) === Number(selectedConversation.id)
+            ) {
+                setMessages(prev =>
+                    prev.map(msg =>
+                        Number(msg.sender_id) !== Number(data.readerId)
+                            ? { ...msg, is_read: true }
+                            : msg
+                    )
+                );
             }
         };
 
         socket.on("receive_message", handleReceiveMessage);
+        socket.on("messages_read", handleMessagesRead);
 
         return () => {
             socket.off("receive_message", handleReceiveMessage);
+            socket.off("messages_read", handleMessagesRead);
         };
-    }, [selectedConversation]);
+    }, [selectedConversation, currentUser]);
 
     /* =====================================================
        Step 11: START DIRECT CHAT FUNCTION
@@ -354,13 +384,37 @@ export default function Home() {
         }
     };
 
-    const viewSource = (messageId: number) => {
-        document.getElementById(`message-${messageId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    const viewSource = (sourceIds?: number | number[]) => {
+        if (!sourceIds) return;
+        const ids = Array.isArray(sourceIds) ? sourceIds : [sourceIds];
+        const targetId = ids.find(id => typeof id === "number" && !isNaN(id));
+        if (!targetId) return;
+
+        const element = document.getElementById(`message-${targetId}`);
+        if (element) {
+            element.scrollIntoView({ behavior: "smooth", block: "center" });
+            setHighlightedMessageId(targetId);
+            window.setTimeout(() => {
+                setHighlightedMessageId(prev => (prev === targetId ? null : prev));
+            }, 3000);
+        } else {
+            console.warn(`Source message #${targetId} not found in DOM`);
+        }
     };
 
-    const sourceButton = (sourceIds: number[]) => (
-        <button onClick={() => viewSource(sourceIds[0])}>View source</button>
-    );
+    const sourceButton = (sourceIds?: number[]) => {
+        if (!sourceIds || sourceIds.length === 0) return null;
+        return (
+            <button
+                type="button"
+                className="view-source-btn"
+                onClick={() => viewSource(sourceIds)}
+                title={`Jump to source message #${sourceIds[0]}`}
+            >
+                🔍 View source {sourceIds.length > 1 ? `(#${sourceIds[0]}+)` : `#${sourceIds[0]}`}
+            </button>
+        );
+    };
 
     /* =====================================================
        ENTER KEY
@@ -543,7 +597,7 @@ export default function Home() {
             {/* =================================================
                 MAIN CHAT
             ================================================= */}
-            <section className="chat-area">
+            <section className={`chat-area ${showSummary && summaryData ? "has-summary" : ""}`}>
                 {!selectedConversation ? (
                     <div className="empty-chat">
                         <div className="empty-chat-icon">✦</div>
@@ -589,26 +643,37 @@ export default function Home() {
 
                         {/* MESSAGES */}
                         <div className="messages">
-                            {messages.map(msg => (
-                                <div
-                                    key={msg.id}
-                                    id={`message-${msg.id}`}
-                                    className={
-                                        Number(msg.sender_id) === Number(currentUser?.id)
-                                            ? "message own"
-                                            : "message"
-                                    }
-                                >
-                                    {Number(msg.sender_id) !== Number(currentUser?.id) && <div className="sender">{msg.sender_name}</div>}
-                                    <div className="message-content">{msg.content}</div>
-                                    <div className="message-time">
-                                        {new Date(msg.created_at).toLocaleTimeString([], {
-                                            hour: "2-digit",
-                                            minute: "2-digit"
-                                        })}
+                            {messages.map(msg => {
+                                const isOwn = Number(msg.sender_id) === Number(currentUser?.id);
+                                const isHighlighted = highlightedMessageId === msg.id;
+                                return (
+                                    <div
+                                        key={msg.id}
+                                        id={`message-${msg.id}`}
+                                        className={`message ${isOwn ? "own" : ""} ${isHighlighted ? "highlighted" : ""}`}
+                                    >
+                                        {!isOwn && <div className="sender">{msg.sender_name}</div>}
+                                        <div className="message-content">{msg.content}</div>
+                                        <div className="message-meta">
+                                            <span className="message-time">
+                                                {new Date(msg.created_at).toLocaleTimeString([], {
+                                                    hour: "2-digit",
+                                                    minute: "2-digit"
+                                                })}
+                                            </span>
+                                            {isOwn && (
+                                                <span
+                                                    className={`read-receipt ${msg.is_read ? "read" : "sent"}`}
+                                                    title={msg.is_read ? "Read" : "Sent"}
+                                                    aria-label={msg.is_read ? "Read receipt: Seen" : "Read receipt: Sent"}
+                                                >
+                                                    {msg.is_read ? "✓✓" : "✓"}
+                                                </span>
+                                            )}
+                                        </div>
                                     </div>
-                                </div>
-                            ))}
+                                );
+                            })}
                         </div>
 
                         {/* MESSAGE INPUT */}

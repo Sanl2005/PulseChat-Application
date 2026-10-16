@@ -613,6 +613,7 @@ app.get(
                 `
                 SELECT
                     m.id,
+                    m.conversation_id,
                     m.content,
                     m.sender_id,
                     COALESCE(
@@ -1331,6 +1332,16 @@ io.on("connection", (socket) => {
                         conversationId,
                         userId
                     ]
+                );
+
+                io.to(
+                    `conversation_${conversationId}`
+                ).emit(
+                    "messages_read",
+                    {
+                        conversationId: Number(conversationId),
+                        readerId: Number(userId)
+                    }
                 );
 
             } catch (error) {
