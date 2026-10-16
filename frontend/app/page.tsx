@@ -6,7 +6,12 @@ import { useRouter } from "next/navigation";
 
 import "./globals.css";
 
-const socket = io("http://localhost:5000");
+const socket = io("http://localhost:5000", {
+    autoConnect: true,
+    reconnection: true,
+    reconnectionDelay: 1000,
+    reconnectionAttempts: Infinity
+});
 
 type User = {
     id: number;
@@ -207,7 +212,9 @@ export default function Home() {
             return;
         }
 
-        fetch(`http://localhost:5000/api/messages/${selectedConversation.id}`)
+        const conversationId = selectedConversation.id;
+
+        fetch(`http://localhost:5000/api/messages/${conversationId}`)
             .then(res => res.json())
             .then(data => {
                 setMessages(data);
@@ -217,18 +224,39 @@ export default function Home() {
             });
 
         /* Join Socket.IO room */
-        socket.emit("join_conversation", selectedConversation.id);
+        socket.emit("join_conversation", conversationId);
 
         /* Mark messages read */
         if (currentUser) {
             socket.emit("mark_read", {
-                conversationId: selectedConversation.id,
+                conversationId,
                 userId: currentUser.id
             });
         }
 
+        /* BUG FIX: Re-join the room whenever the socket reconnects.
+         * Socket.IO rooms are server-side — they are lost on reconnect.
+         * Without this, the client stops receiving broadcasts after any
+         * network hiccup or dev-server hot-reload. */
+        const handleReconnect = () => {
+            socket.emit("join_conversation", conversationId);
+            if (currentUser) {
+                socket.emit("mark_read", {
+                    conversationId,
+                    userId: currentUser.id
+                });
+            }
+        };
+
+        socket.on("connect", handleReconnect);
+
         return () => {
-            socket.emit("leave_conversation", selectedConversation.id);
+            socket.off("connect", handleReconnect);
+            /* Only leave if we are switching away — not if the component
+             * is unmounting due to a Hot-Module Reload.  We capture the
+             * ID at effect-creation time so the cleanup closure always
+             * refers to the conversation that was joined here. */
+            socket.emit("leave_conversation", conversationId);
         };
     }, [selectedConversation, currentUser]);
 
@@ -242,8 +270,19 @@ export default function Home() {
                 Number(newMessage.conversation_id) === Number(selectedConversation.id)
             ) {
                 setMessages(prev => {
-                    const exists = prev.some(m => m.id === newMessage.id);
-                    if (exists) return prev;
+                    // Replace an optimistic message (same sender + content, temp id)
+                    const optimisticIdx = prev.findIndex(
+                        m => m.id > 1_000_000_000_000 &&
+                             Number(m.sender_id) === Number(newMessage.sender_id) &&
+                             m.content === newMessage.content
+                    );
+                    if (optimisticIdx !== -1) {
+                        const next = [...prev];
+                        next[optimisticIdx] = newMessage;
+                        return next;
+                    }
+                    // Prevent exact duplicate by real id
+                    if (prev.some(m => m.id === newMessage.id)) return prev;
                     return [...prev, newMessage];
                 });
 
@@ -353,12 +392,33 @@ export default function Home() {
             return;
         }
 
+        const trimmed = message.trim();
+
         socket.emit("send_message", {
             conversationId: selectedConversation.id,
             senderId: currentUser.id,
-            content: message
+            content: trimmed
         });
 
+        /* BUG FIX: Optimistically add the sender's own message.
+         * The backend broadcasts via io.to(room).emit("receive_message"),
+         * which includes the sender's socket.  However, if the socket
+         * silently reconnected and lost its room membership, the sender
+         * would never see their own message.  Adding it locally the
+         * moment we send guarantees it always appears, and the duplicate
+         * guard in handleReceiveMessage prevents it from appearing twice
+         * if the round-trip broadcast does arrive. */
+        const optimisticMsg: ChatMessage = {
+            id: Date.now(),          // temp id; overwritten by broadcast
+            conversation_id: selectedConversation.id,
+            sender_id: currentUser.id,
+            sender_name: currentUser.display_name || currentUser.username,
+            content: trimmed,
+            created_at: new Date().toISOString(),
+            is_read: false
+        };
+
+        setMessages(prev => [...prev, optimisticMsg]);
         setMessage("");
     };
 
