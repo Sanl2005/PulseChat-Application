@@ -97,6 +97,16 @@ develop-eggs/
 .coverage.*
 htmlcov/
 .ipynb_checkpoints/
+*.pt
+*.pth
+*.bin
+*.onnx
+*.safetensors
+*.ckpt
+*.h5
+*.tflite
+.cache/
+**/.cache/
 
 # Local Database Files
 *.sqlite
